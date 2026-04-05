@@ -11,6 +11,13 @@ dist/
 cdk.out/
 .cdk.staging/
 
+# Terraform
+iac/.terraform/
+iac/**/.builds/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+
 # Environment
 .env
 .env.local
