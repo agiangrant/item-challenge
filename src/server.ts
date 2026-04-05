@@ -12,6 +12,7 @@ import { createServer, IncomingMessage, ServerResponse } from "http";
 import type { APIGatewayProxyEvent, LambdaHandler } from "./types/lambda.js";
 import { handler as createItem } from "./handlers/createItem.js";
 import { handler as getItem } from "./handlers/getItem.js";
+import { handler as listItems } from "./handlers/listItems.js";
 
 const PORT = process.env.PORT || 3000;
 
@@ -27,6 +28,7 @@ interface Route {
 
 const routes: Route[] = [
   { method: "GET", path: "/api/items/:id", handler: getItem },
+  { method: "GET", path: "/api/items", handler: listItems },
   { method: "POST", path: "/api/items", handler: createItem },
 ];
 
