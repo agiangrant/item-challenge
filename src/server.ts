@@ -12,7 +12,10 @@ import { createServer, IncomingMessage, ServerResponse } from "http";
 import type { APIGatewayProxyEvent, LambdaHandler } from "./types/lambda.js";
 import { handler as createItem } from "./handlers/createItem.js";
 import { handler as getItem } from "./handlers/getItem.js";
+import { handler as updateItem } from "./handlers/updateItem.js";
 import { handler as listItems } from "./handlers/listItems.js";
+import { handler as createVersion } from "./handlers/createVersion.js";
+import { handler as getAuditTrail } from "./handlers/getAuditTrail.js";
 
 const PORT = process.env.PORT || 3000;
 
@@ -27,7 +30,10 @@ interface Route {
 }
 
 const routes: Route[] = [
+  { method: "GET", path: "/api/items/:id/audit", handler: getAuditTrail },
+  { method: "POST", path: "/api/items/:id/versions", handler: createVersion },
   { method: "GET", path: "/api/items/:id", handler: getItem },
+  { method: "PUT", path: "/api/items/:id", handler: updateItem },
   { method: "GET", path: "/api/items", handler: listItems },
   { method: "POST", path: "/api/items", handler: createItem },
 ];
