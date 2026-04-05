@@ -1,17 +1,15 @@
 /**
- * DynamoDB Storage Implementation (Optional)
+ * DynamoDB Storage Implementation
  *
- * This implementation uses AWS DynamoDB for persistent storage.
+ * Uses a version-0 convention for the sort key:
+ *   SK=0  → current state of the item (overwritten on every update)
+ *   SK=1+ → immutable historical snapshots (audit trail)
  *
- * To use this:
- * 1. Set environment variable: USE_DYNAMODB=true
- * 2. Configure AWS credentials (or use DynamoDB Local)
- * 3. Set DYNAMODB_TABLE_NAME (or use default "ExamItems")
- *
- * For DynamoDB Local:
- * - Download from: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html
- * - Run: java -Djava.library.path=./DynamoDBLocal_lib -jar DynamoDBLocal.jar -sharedDb
- * - Set DYNAMODB_ENDPOINT=http://localhost:8000
+ * Environment variables:
+ *   USE_DYNAMODB=true
+ *   DYNAMODB_TABLE_NAME (default "ExamItems")
+ *   DYNAMODB_ENDPOINT   (for local DynamoDB)
+ *   AWS_REGION          (default "us-east-1")
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -19,13 +17,20 @@ import {
   DynamoDBDocumentClient,
   PutCommand,
   GetCommand,
-  UpdateCommand,
+  QueryCommand,
   ScanCommand,
-  QueryCommand
+  TransactWriteCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { randomUUID } from 'crypto';
-import { ExamItem, CreateItemRequest, UpdateItemRequest, ListItemsQuery } from '../types/item.js';
+import { ExamItem, CreateItemRequest, UpdateItemRequest, ListItemsQuery, ListItemsResponse } from '../types/item.js';
 import { ItemStorage } from './interface.js';
+
+/** Shape of a DynamoDB record — ExamItem + sort key + denormalized GSI fields */
+interface DynamoRecord extends ExamItem {
+  version: number;
+  status: string;
+  lastModified: number;
+}
 
 export class DynamoDBStorage implements ItemStorage {
   private client: DynamoDBDocumentClient;
@@ -54,9 +59,14 @@ export class DynamoDBStorage implements ItemStorage {
       },
     };
 
-    await this.client.send(new PutCommand({
-      TableName: this.tableName,
-      Item: item,
+    const record = this.toRecord(item, 0);
+    const snapshot = this.toRecord(item, 1);
+
+    await this.client.send(new TransactWriteCommand({
+      TransactItems: [
+        { Put: { TableName: this.tableName, Item: record } },
+        { Put: { TableName: this.tableName, Item: snapshot } },
+      ],
     }));
 
     return item;
@@ -65,10 +75,10 @@ export class DynamoDBStorage implements ItemStorage {
   async getItem(id: string): Promise<ExamItem | null> {
     const result = await this.client.send(new GetCommand({
       TableName: this.tableName,
-      Key: { id },
+      Key: { id, version: 0 },
     }));
 
-    return result.Item as ExamItem || null;
+    return result.Item ? this.fromRecord(result.Item as DynamoRecord) : null;
   }
 
   async updateItem(id: string, data: UpdateItemRequest): Promise<ExamItem | null> {
@@ -87,35 +97,118 @@ export class DynamoDBStorage implements ItemStorage {
       },
     };
 
-    await this.client.send(new PutCommand({
-      TableName: this.tableName,
-      Item: updated,
+    const record = this.toRecord(updated, 0);
+    const snapshot = this.toRecord(updated, updated.metadata.version);
+
+    await this.client.send(new TransactWriteCommand({
+      TransactItems: [
+        { Put: { TableName: this.tableName, Item: record } },
+        { Put: { TableName: this.tableName, Item: snapshot } },
+      ],
     }));
 
     return updated;
   }
 
-  async listItems(query: ListItemsQuery): Promise<{ items: ExamItem[]; total: number }> {
-    // Note: This is a basic implementation using Scan
-    // For production, you should use Query with appropriate indexes
-    const result = await this.client.send(new ScanCommand({
-      TableName: this.tableName,
-      Limit: query.limit || 10,
-    }));
+  async listItems(query: ListItemsQuery): Promise<ListItemsResponse> {
+    const limit = query.limit || 20;
+    const startKey = query.cursor
+      ? JSON.parse(Buffer.from(query.cursor, 'base64').toString())
+      : undefined;
 
-    const items = (result.Items || []) as ExamItem[];
-    return { items, total: result.Count || 0 };
+    let result;
+
+    if (query.status) {
+      result = await this.client.send(new QueryCommand({
+        TableName: this.tableName,
+        IndexName: 'status-lastModified-index',
+        KeyConditionExpression: '#status = :status',
+        FilterExpression: 'version = :zero',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': query.status, ':zero': 0 },
+        ScanIndexForward: false,
+        Limit: limit,
+        ...(startKey && { ExclusiveStartKey: startKey }),
+      }));
+    } else if (query.subject) {
+      result = await this.client.send(new QueryCommand({
+        TableName: this.tableName,
+        IndexName: 'subject-lastModified-index',
+        KeyConditionExpression: 'subject = :subject',
+        FilterExpression: 'version = :zero',
+        ExpressionAttributeValues: { ':subject': query.subject, ':zero': 0 },
+        ScanIndexForward: false,
+        Limit: limit,
+        ...(startKey && { ExclusiveStartKey: startKey }),
+      }));
+    } else {
+      result = await this.client.send(new ScanCommand({
+        TableName: this.tableName,
+        FilterExpression: 'version = :zero',
+        ExpressionAttributeValues: { ':zero': 0 },
+        Limit: limit,
+        ...(startKey && { ExclusiveStartKey: startKey }),
+      }));
+    }
+
+    const items = (result.Items || []).map(i => this.fromRecord(i as DynamoRecord));
+    const cursor = result.LastEvaluatedKey
+      ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64')
+      : undefined;
+
+    return { items, cursor };
   }
 
   async createVersion(id: string): Promise<ExamItem | null> {
-    // TODO: Implement versioning strategy
-    // Options: Separate versions table, same table with sort key, etc.
-    throw new Error('Not implemented - define your versioning strategy');
+    const existing = await this.getItem(id);
+    if (!existing) return null;
+
+    const newVersion: ExamItem = {
+      ...existing,
+      metadata: {
+        ...existing.metadata,
+        version: existing.metadata.version + 1,
+        lastModified: Date.now(),
+      },
+    };
+
+    const record = this.toRecord(newVersion, 0);
+    const snapshot = this.toRecord(newVersion, newVersion.metadata.version);
+
+    await this.client.send(new TransactWriteCommand({
+      TransactItems: [
+        { Put: { TableName: this.tableName, Item: record } },
+        { Put: { TableName: this.tableName, Item: snapshot } },
+      ],
+    }));
+
+    return newVersion;
   }
 
   async getAuditTrail(id: string): Promise<ExamItem[]> {
-    // TODO: Implement audit trail retrieval
-    // This depends on your versioning strategy
-    throw new Error('Not implemented - define your audit trail strategy');
+    const result = await this.client.send(new QueryCommand({
+      TableName: this.tableName,
+      KeyConditionExpression: 'id = :id AND version > :zero',
+      ExpressionAttributeValues: { ':id': id, ':zero': 0 },
+      ScanIndexForward: true,
+    }));
+
+    return (result.Items || []).map(i => this.fromRecord(i as DynamoRecord));
+  }
+
+  /** Build a DynamoDB record with sort key + denormalized GSI fields */
+  private toRecord(item: ExamItem, version: number): DynamoRecord {
+    return {
+      ...item,
+      version,
+      status: item.metadata.status,
+      lastModified: item.metadata.lastModified,
+    };
+  }
+
+  /** Strip DynamoDB sort key + denormalized fields back to a clean ExamItem */
+  private fromRecord(record: DynamoRecord): ExamItem {
+    const { version: _sk, status: _status, lastModified: _lm, ...item } = record;
+    return item as ExamItem;
   }
 }

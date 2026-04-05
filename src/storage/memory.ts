@@ -6,7 +6,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import { ExamItem, CreateItemRequest, UpdateItemRequest, ListItemsQuery } from '../types/item.js';
+import { ExamItem, CreateItemRequest, UpdateItemRequest, ListItemsQuery, ListItemsResponse } from '../types/item.js';
 import { ItemStorage } from './interface.js';
 
 export class MemoryStorage implements ItemStorage {
@@ -62,8 +62,11 @@ export class MemoryStorage implements ItemStorage {
     return updated;
   }
 
-  async listItems(query: ListItemsQuery): Promise<{ items: ExamItem[]; total: number }> {
+  async listItems(query: ListItemsQuery): Promise<ListItemsResponse> {
     let items = Array.from(this.items.values());
+
+    // Sort by lastModified descending
+    items.sort((a, b) => b.metadata.lastModified - a.metadata.lastModified);
 
     // Filter by subject
     if (query.subject) {
@@ -75,14 +78,17 @@ export class MemoryStorage implements ItemStorage {
       items = items.filter(item => item.metadata.status === query.status);
     }
 
-    const total = items.length;
+    // Cursor-based pagination (cursor = base64-encoded offset for memory storage)
+    const offset = query.cursor ? parseInt(Buffer.from(query.cursor, 'base64').toString(), 10) : 0;
+    const limit = query.limit || 20;
+    const page = items.slice(offset, offset + limit);
 
-    // Pagination
-    const offset = query.offset || 0;
-    const limit = query.limit || 10;
-    items = items.slice(offset, offset + limit);
+    const nextOffset = offset + limit;
+    const cursor = nextOffset < items.length
+      ? Buffer.from(String(nextOffset)).toString('base64')
+      : undefined;
 
-    return { items, total };
+    return { items: page, cursor };
   }
 
   async createVersion(id: string): Promise<ExamItem | null> {
